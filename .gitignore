@@ -1,0 +1,15 @@
+# 构建产物
+*.exe
+*.o
+*.obj
+*.bmp
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 预览导出临时文件
+prev_*.bmp
+zoom_check.png
