@@ -16,6 +16,7 @@
 #define _UNICODE
 #include <windows.h>
 #include <shellapi.h>
+#include <dbt.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidpi.h>
@@ -27,9 +28,14 @@
 #define TRAY_ID       1
 #define WM_TRAY       (WM_APP + 1)
 #define TIMER_POLL    1
+#define TIMER_KICK    2   /* 设备插拔后的一次性刷新 */
 
 #define VID_MATCH  0x373B
-#define PID_MATCH  0x11DC
+/* 以前按 PID 硬匹配接收器（0x11DC），但插上数据线后鼠标本体是另一个 PID（如 0x1264），
+ * 且不同批次的接收器 PID 也会变。所以改成只按厂商 + 厂商自定义 usage page 匹配，
+ * 再用应答内容判断读到的是不是真电量。 */
+#define USAGE_PAGE_MATCH 0xFF05
+#define USAGE_MATCH      0x0001
 
 #ifndef NOTIFYICON_VERSION_4
 #define NOTIFYICON_VERSION_4 4
@@ -49,7 +55,14 @@ static UINT       g_taskbarCreated = 0;
 static int        g_percent = -1;
 static wchar_t    g_tip[160] = L"ATK A9 Pro Max";
 
-typedef struct { int ok; int percent; int mv; int asleep; } BatState;
+typedef struct {
+    int ok;        /* 读到有效电量 */
+    int percent;
+    int mv;
+    int asleep;    /* 设备在，但没应答（休眠 / 接收器后面没鼠标） */
+    int wired;     /* 1 = 数据线直连读到的（link 0），0 = 经 2.4G 接收器转发（link 1） */
+    int seen;      /* 至少有一个 ATK 设备应答过，用来区分"没设备"和"设备休眠" */
+} BatState;
 
 /* ---------- HID ---------- */
 
@@ -112,9 +125,9 @@ static BatState query_battery(void) {
             ZeroMemory(&att, sizeof att); att.Size = sizeof att;
             ZeroMemory(&caps, sizeof caps);
             if (HidD_GetAttributes(h, &att) && att.VendorID == VID_MATCH &&
-                att.ProductID == PID_MATCH && HidD_GetPreparsedData(h, &pp)) {
+                HidD_GetPreparsedData(h, &pp)) {
                 if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS &&
-                    caps.UsagePage == 0xFF05 && caps.Usage == 0x0001) {
+                    caps.UsagePage == USAGE_PAGE_MATCH && caps.Usage == USAGE_MATCH) {
                     matched = TRUE;
                 }
                 HidD_FreePreparsedData(pp);
@@ -123,28 +136,39 @@ static BatState query_battery(void) {
             if (matched) {
                 DWORD olen = caps.OutputReportByteLength, ilen = caps.InputReportByteLength;
                 BYTE *out, *in;
+                int li;
                 if (olen < 9) olen = 9;
                 if (ilen < 10) ilen = 10;
                 out = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, olen);
                 in  = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ilen);
                 if (out && in) {
                     out[0] = 0x08; out[1] = 0x7D; out[2] = 0x72; out[3] = 0x02;
-                    out[5] = 0x01; out[6] = 0x07; out[7] = 0x01;
-                    if (ovl_write(h, out, olen)) {
-                        int tries;
-                        Sleep(100);
-                        for (tries = 0; tries < 8; tries++) {
-                            DWORD n = ovl_read(h, in, ilen, 250);
+                    out[6] = 0x07; out[7] = 0x01;
+
+                    /* out[5] 是链路：1 = 鼠标挂在接收器后面，0 = 数据线直连。
+                     * 先试直连（有线时这条才通），再试接收器转发。 */
+                    for (li = 0; li <= 1; li++) {
+                        int handler = -1, pct = 0, mv = 0, tries;
+                        out[5] = (BYTE)li;
+                        if (!ovl_write(h, out, olen)) continue;
+                        Sleep(80);
+                        for (tries = 0; tries < 5; tries++) {
+                            DWORD n = ovl_read(h, in, ilen, 150);
                             if (!n) break;
                             if (n >= 10 && in[1] == 0x72 && in[5] == 0x07) {
-                                if (in[2] == 0x00) {
-                                    st.ok = 1; st.percent = in[7];
-                                    st.mv = in[8] | (in[9] << 8);
-                                } else {
-                                    st.ok = 1; st.asleep = 1;
-                                }
+                                handler = in[2];
+                                pct = in[7];
+                                mv = in[8] | (in[9] << 8);
                                 break;
                             }
+                        }
+                        if (handler < 0) continue;      /* 这条链路没人应答 */
+                        st.seen = 1;
+                        /* handler == 0 才是鼠标本人应答。接收器在、鼠标不在时
+                         * 会回 0% / 0 mV 的占位数据，得排掉，否则充电时会显示 0%。 */
+                        if (handler == 0 && (mv >= 2000 || pct > 0)) {
+                            st.ok = 1; st.percent = pct; st.mv = mv; st.wired = (li == 0);
+                            break;
                         }
                     }
                 }
@@ -156,6 +180,7 @@ static BatState query_battery(void) {
         HeapFree(GetProcessHeap(), 0, det);
         if (st.ok) break;
     }
+    if (!st.ok && st.seen) st.asleep = 1;   /* 有设备应答但没给数：休眠 */
     SetupDiDestroyDeviceInfoList(devs);
     return st;
 }
@@ -382,15 +407,15 @@ static void poll_now(void) {
     if (size < 16) size = 16;
     GetLocalTime(&t);
 
-    if (!st.ok) {
+    if (st.asleep) {
+        nicon = make_icon(NULL, size, COL_IDLE, NULL);
+        if (g_percent >= 0) wsprintfW(g_tip, L"ATK A9 Pro Max：休眠中（上次 %d%%）", g_percent);
+        else lstrcpynW(g_tip, L"ATK A9 Pro Max：休眠中，动一下鼠标", 160);
+    } else if (!st.ok) {
         nicon = make_icon(NULL, size, COL_IDLE, NULL);
         lstrcpynW(g_tip, L"ATK A9 Pro Max：未检测到接收器", 160);
         g_percent = -1;
         warned = 0;
-    } else if (st.asleep) {
-        nicon = make_icon(NULL, size, COL_IDLE, NULL);
-        if (g_percent >= 0) wsprintfW(g_tip, L"ATK A9 Pro Max：休眠中（上次 %d%%）", g_percent);
-        else lstrcpynW(g_tip, L"ATK A9 Pro Max：休眠中，动一下鼠标", 160);
     } else {
         COLORREF c = COL_OK;
         int vi = st.mv / 1000, vm = (st.mv % 1000) / 10;
@@ -400,11 +425,11 @@ static void poll_now(void) {
         else wsprintfW(num, L"%d", st.percent);
         nicon = make_icon(num, size, c, NULL);
         if (st.mv > 3000 && st.mv < 4700)
-            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%  %d.%02d V\n更新于 %02d:%02d",
-                      st.percent, vi, vm, t.wHour, t.wMinute);
+            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%  %d.%02d V%s\n更新于 %02d:%02d",
+                      st.percent, vi, vm, st.wired ? L"（有线）" : L"", t.wHour, t.wMinute);
         else
-            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%\n更新于 %02d:%02d",
-                      st.percent, t.wHour, t.wMinute);
+            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%%s\n更新于 %02d:%02d",
+                      st.percent, st.wired ? L"（有线）" : L"", t.wHour, t.wMinute);
 
         if (st.percent <= 20 && !warned) {
             wchar_t body[96];
@@ -478,12 +503,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) poll_now();
         else if (LOWORD(lp) == WM_RBUTTONUP) show_menu();
         return 0;
+    case WM_DEVICECHANGE:
+        /* 插拔数据线 / 接收器后 1.2 秒自动刷新一次（等系统枚举完成），
+         * 不用等下一个轮询周期。 */
+        if (wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE)
+            SetTimer(hwnd, TIMER_KICK, 1200, NULL);
+        return TRUE;
     case WM_TIMER:
         if (wp == TIMER_POLL) poll_now();
+        else if (wp == TIMER_KICK) { KillTimer(hwnd, TIMER_KICK); poll_now(); }
         return 0;
     case WM_DESTROY: {
         NOTIFYICONDATAW nid;
         KillTimer(hwnd, TIMER_POLL);
+        KillTimer(hwnd, TIMER_KICK);
         ZeroMemory(&nid, sizeof nid);
         nid.cbSize = sizeof nid; nid.hWnd = hwnd; nid.uID = TRAY_ID;
         Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -500,9 +533,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     if (cmdline && wcsstr(cmdline, L"--once")) {
         BatState st = query_battery();
-        if (!st.ok) printf("no device\n");
+        if (st.ok) printf("%d%% (%d mV)%s\n", st.percent, st.mv, st.wired ? " wired" : "");
         else if (st.asleep) printf("asleep\n");
-        else printf("%d%% (%d mV)\n", st.percent, st.mv);
+        else printf("no device\n");
         return 0;
     }
 
