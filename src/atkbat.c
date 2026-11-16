@@ -46,6 +46,7 @@
 #define MENU_60S      1003
 #define MENU_5MIN     1004
 #define MENU_15MIN    1006
+#define MENU_CAL      1007
 #define MENU_STARTUP  1005
 #define MENU_EXIT     1009
 
@@ -53,6 +54,7 @@ static HICON      g_icon = NULL;
 static HWND       g_hwnd = NULL;
 static UINT       g_taskbarCreated = 0;
 static int        g_percent = -1;
+static int        g_cal = -1;    /* -1 = 未读取；0/1 = 是否按电压校准 */
 static wchar_t    g_tip[160] = L"ATK A9 Pro Max";
 
 typedef struct {
@@ -396,16 +398,43 @@ static void tray_balloon(const wchar_t *title, const wchar_t *text) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+/* ---------- 电量校准 ----------
+ * 固件的百分比是电压的线性映射，拟合 26 个采样点得到：
+ *     0% ≈ 3.49 V   100% ≈ 4.35 V   约 8.6 mV / 1%
+ * 而锂电芯静止时的满电上限只有 4.20 V，所以"100%"这个状态只在插线充电时存在，
+ * 一拔线就固定掉到 84% 附近。开启校准后改用 4.20 V = 100%、3.50 V = 0% 重算，
+ * 图标即可从 100 正常往下走；关闭时原样显示固件值。 */
+#define CAL_MV_100  4200
+#define CAL_MV_0    3500
+
+static int cal_on(void) {
+    if (g_cal < 0) g_cal = (int)reg_get(L"Calibrate", 0);
+    return g_cal != 0;
+}
+
+static int cal_percent(const BatState *st) {
+    int p;
+    if (st->mv < 1000) return st->percent;          /* 电压无效时退回原值 */
+    p = (st->mv - CAL_MV_0) * 100 / (CAL_MV_100 - CAL_MV_0);
+    if (p < 0) p = 0;
+    if (p > 100) p = 100;
+    return p;
+}
+
 static void poll_now(void) {
     BatState st = query_battery();
     wchar_t num[8];
     static int warned = 0;
     SYSTEMTIME t;
     int size = GetSystemMetrics(SM_CXSMICON);
+    int rawpct;
     HICON nicon;
 
     if (size < 16) size = 16;
     GetLocalTime(&t);
+
+    rawpct = st.percent;
+    if (st.ok && cal_on()) st.percent = cal_percent(&st);
 
     if (st.asleep) {
         nicon = make_icon(NULL, size, COL_IDLE, NULL);
@@ -419,17 +448,19 @@ static void poll_now(void) {
     } else {
         COLORREF c = COL_OK;
         int vi = st.mv / 1000, vm = (st.mv % 1000) / 10;
+        wchar_t tail[48] = L"";
+        if (rawpct != st.percent) wsprintfW(tail, L"（固件 %d%%）", rawpct);
         if (st.percent <= 20) c = COL_LOW;
         else if (st.percent <= 40) c = COL_MID;
         if (st.percent >= 100) lstrcpynW(num, L"F", 8);   /* 满电用 F，两位数位置放得更大 */
         else wsprintfW(num, L"%d", st.percent);
         nicon = make_icon(num, size, c, NULL);
         if (st.mv > 3000 && st.mv < 4700)
-            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%  %d.%02d V%s\n更新于 %02d:%02d",
-                      st.percent, vi, vm, st.wired ? L"（有线）" : L"", t.wHour, t.wMinute);
+            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%  %d.%02d V%s%s\n更新于 %02d:%02d",
+                      st.percent, vi, vm, st.wired ? L"（有线）" : L"", tail, t.wHour, t.wMinute);
         else
-            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%%s\n更新于 %02d:%02d",
-                      st.percent, st.wired ? L"（有线）" : L"", t.wHour, t.wMinute);
+            wsprintfW(g_tip, L"ATK A9 Pro Max：%d%%%s%s\n更新于 %02d:%02d",
+                      st.percent, st.wired ? L"（有线）" : L"", tail, t.wHour, t.wMinute);
 
         if (st.percent <= 20 && !warned) {
             wchar_t body[96];
@@ -459,6 +490,8 @@ static void show_menu(void) {
     AppendMenuW(m, MF_STRING | (iv == 300 ? MF_CHECKED : 0), MENU_5MIN, L"刷新间隔 5 分钟");
     AppendMenuW(m, MF_STRING | (iv == 900 ? MF_CHECKED : 0), MENU_15MIN, L"刷新间隔 15 分钟");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (cal_on() ? MF_CHECKED : 0), MENU_CAL, L"按电压校准电量");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (startup_enabled() ? MF_CHECKED : 0), MENU_STARTUP, L"开机自启");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, MENU_EXIT, L"退出");
@@ -481,6 +514,11 @@ static void show_menu(void) {
         SetTimer(g_hwnd, TIMER_POLL, sec * 1000, NULL);
         break;
     }
+    case MENU_CAL:
+        g_cal = cal_on() ? 0 : 1;
+        reg_set(L"Calibrate", (DWORD)g_cal);
+        poll_now();
+        break;
     case MENU_STARTUP:
         startup_set(!startup_enabled());
         break;
@@ -533,7 +571,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show) {
 
     if (cmdline && wcsstr(cmdline, L"--once")) {
         BatState st = query_battery();
-        if (st.ok) printf("%d%% (%d mV)%s\n", st.percent, st.mv, st.wired ? " wired" : "");
+        if (st.ok) {
+            char suffix[32] = "";
+            if (cal_on()) {
+                int cp = cal_percent(&st);
+                if (cp != st.percent) wsprintfA(suffix, " cal=%d%%", cp);
+            }
+            printf("%d%% (%d mV)%s%s\n", st.percent, st.mv, st.wired ? " wired" : "", suffix);
+        }
         else if (st.asleep) printf("asleep\n");
         else printf("no device\n");
         return 0;
